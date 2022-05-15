@@ -2,19 +2,20 @@
 authors = ["Nick Massey <nickmass@nickmass.com>"]
 name = "mass-dyndns"
 version = "0.1.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-env_logger = "0.6"
-failure = "0.1"
-futures = "0.1"
-hyper = "0.12"
+env_logger = "0.9"
+hyper = {version = "0.14", features = ["server", "http1", "http2"]}
 log = "0.4"
-rusoto_core = "0.36"
-rusoto_route53 = "0.36"
-rusoto_credential = "0.15"
+rusoto_core = "0.48"
+rusoto_route53 = "0.48"
+rusoto_credential = "0.48"
 serde = "1.0"
 serde_derive = "1.0"
-url = "1.7"
-base64 = "0.10.1"
-toml = "0.4.10"
+url = "2.2"
+base64 = "0.13.0"
+toml = "0.5.9"
+thiserror = "1.0.24"
+tokio = {version = "1.6.0", features = ["full"]}
+clap = {version = "3.1", features = ["derive"]}

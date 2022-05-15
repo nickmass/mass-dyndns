@@ -1,40 +1,57 @@
-use failure::{Error, Fail};
-use futures::{Future, IntoFuture};
-use hyper::header::{HeaderValue, AUTHORIZATION};
-use hyper::service::service_fn;
-use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use clap::Parser;
+use hyper::{
+    header::{HeaderValue, AUTHORIZATION},
+    service::{make_service_fn, service_fn},
+    Body, Method, Request, Response, Server, StatusCode,
+};
 use log::{error, info, warn};
-use rusoto_core::request::HttpClient as RusotoHttpClient;
+use rusoto_core::{region::ParseRegionError, request::HttpClient as RusotoHttpClient, RusotoError};
 use rusoto_credential::StaticProvider;
-use rusoto_route53::{Route53, Route53Client};
+use rusoto_route53::{ChangeResourceRecordSetsError, Route53, Route53Client};
 use serde_derive::{Deserialize, Serialize};
+use thiserror::Error;
 use url::Url;
 
-use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fs::File;
 use std::io::Read;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::{collections::HashMap, path::PathBuf};
 
-#[derive(Fail, Debug)]
+#[derive(Error, Debug)]
 enum DynDnsError {
-    #[fail(display = "Could not parse supplied IP address")]
+    #[error("Could not parse supplied IP address")]
     InvalidIpAddress,
-    #[fail(display = "The hostname provided is not permitted for this user")]
+    #[error("The hostname provided is not permitted for this user")]
     InvalidHostname,
-    #[fail(display = "The myip and hostname query parameters are required")]
+    #[error("The myip and hostname query parameters are required")]
     InvalidQueryParams,
-    #[fail(display = "Invalid username or password")]
+    #[error("Invalid username or password")]
     InvalidUser,
-    #[fail(display = "Basic Authorization header required")]
+    #[error("Basic Authorization header required")]
     InvalidRequestHeaders,
-    #[fail(display = "Requests must be sent to /nic/update")]
+    #[error("Requests must be sent to /nic/update")]
     InvalidRequestPath,
-    #[fail(display = "Only GET requests are supported")]
+    #[error("Only GET requests are supported")]
     InvalidRequestMethod,
-    #[fail(display = "Invalid request URL")]
+    #[error("Invalid request URL")]
     InvalidRequestUrl,
+    #[error("DNS change request error: {0}")]
+    ChangeRequest(#[from] RusotoError<ChangeResourceRecordSetsError>),
+    #[error("Invalid AWS region: {0}")]
+    InvalidAwsRegion(#[from] ParseRegionError),
+    #[error("Io Error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Toml parse error: {0}")]
+    Toml(#[from] toml::de::Error),
+}
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[clap(short, long, default_value = "./config.toml")]
+    config: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -61,9 +78,11 @@ impl User {
     }
 }
 
-fn main() -> Result<(), Error> {
+#[tokio::main]
+async fn main() -> Result<(), DynDnsError> {
     env_logger::init();
-    let mut config_file = File::open("./config.toml")?;
+    let args = Args::parse();
+    let mut config_file = File::open(args.config)?;
     let mut config_bytes = Vec::new();
     config_file.read_to_end(&mut config_bytes)?;
     let config: Config = toml::from_slice(&config_bytes)?;
@@ -72,25 +91,75 @@ fn main() -> Result<(), Error> {
     info!("Starting listening on: {}", addr);
 
     let dns_client = DnsClient::new(&config)?;
-    let service = Arc::new(DynDnsService::new(dns_client, config.users));
-    let dyn_dns_service = move || {
-        let service = service.clone();
-        service_fn(move |req| service.call(req).map_err(|e| e.compat()))
-    };
+    let context = DynDnsContext::new(dns_client, config.users);
+    let dyn_dns_service = make_service_fn(move |_conn| {
+        let context = context.clone();
+        let service = service_fn(move |req| handler(context.clone(), req));
+
+        async move { Ok::<_, Infallible>(service) }
+    });
 
     let server = Server::bind(&addr).serve(dyn_dns_service);
 
-    hyper::rt::run(server.map_err(|e| error!("FATAL ERROR: {} {:?}", e, e)));
+    if let Err(e) = server.await {
+        error!("Fatal server error: {}", e);
+    }
 
     Ok(())
 }
 
-struct DynDnsService {
-    dns: Arc<DnsClient>,
-    users: HashMap<String, User>,
+async fn call(ctx: DynDnsContext, req: Request<Body>) -> Result<Response<Body>, DynDnsError> {
+    let (ip, hostname) = ctx.get_req_ip(req)?;
+    let _dns_id = ctx.dns.set_ip_record(ip, hostname).await?;
+    let res = Response::new(Body::from(format!("good {}", ip)));
+
+    Ok(res)
 }
 
-impl DynDnsService {
+async fn handler(
+    ctx: DynDnsContext,
+    req: Request<Body>,
+) -> Result<Response<Body>, std::convert::Infallible> {
+    let res = call(ctx, req).await.unwrap_or_else(handle_err);
+
+    Ok(res)
+}
+
+fn handle_err(err: DynDnsError) -> Response<Body> {
+    let (status, res) = match err {
+        DynDnsError::InvalidUser => (StatusCode::FORBIDDEN, err.to_string()),
+
+        DynDnsError::InvalidHostname
+        | DynDnsError::InvalidIpAddress
+        | DynDnsError::InvalidQueryParams
+        | DynDnsError::InvalidRequestHeaders
+        | DynDnsError::InvalidRequestMethod
+        | DynDnsError::InvalidRequestPath
+        | DynDnsError::InvalidRequestUrl => {
+            warn!("Bad Request: {:?}", err);
+            (StatusCode::BAD_REQUEST, err.to_string())
+        }
+        err => {
+            error!("Server error: {} {:?}", err, err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error".to_string(),
+            )
+        }
+    };
+
+    let mut res = Response::new(Body::from(res));
+    *res.status_mut() = status;
+    res
+}
+
+#[derive(Clone)]
+struct DynDnsContext {
+    dns: Arc<DnsClient>,
+    users: Arc<HashMap<String, User>>,
+}
+
+impl DynDnsContext {
     fn new(dns: DnsClient, default_users: impl IntoIterator<Item = User>) -> Self {
         let mut users = HashMap::new();
         for user in default_users {
@@ -100,54 +169,23 @@ impl DynDnsService {
 
         Self {
             dns: Arc::new(dns),
-            users,
+            users: Arc::new(users),
         }
-    }
-
-    fn call(&self, req: Request<Body>) -> impl Future<Item = Response<Body>, Error = Error> {
-        let dns = self.dns.clone();
-        self.get_req_ip(req)
-            .and_then(|(ip, hostname)| Ok(dns.set_ip_record(ip, hostname).join(Ok(ip))))
-            .into_future()
-            .flatten()
-            .and_then(|(_dns_id, ip)| Ok(Response::new(Body::from(format!("good {}", ip)))))
-            .or_else(|error| Ok(Self::handle_err(error)))
-    }
-
-    fn handle_err(err: Error) -> Response<Body> {
-        let (status, res) = match err.downcast::<DynDnsError>() {
-            Ok(e @ DynDnsError::InvalidUser) => (StatusCode::FORBIDDEN, e.to_string()),
-            Ok(err) => {
-                warn!("Bad Request: {:?}", err);
-                (StatusCode::BAD_REQUEST, err.to_string())
-            }
-            Err(err) => {
-                error!("Server error: {} {:?}", err, err);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal Server Error".to_string(),
-                )
-            }
-        };
-
-        let mut res = Response::new(Body::from(res));
-        *res.status_mut() = status;
-        res
     }
 
     fn get_user(&self, auth_string: impl AsRef<str>) -> Option<&User> {
         self.users.get(auth_string.as_ref())
     }
 
-    fn get_req_ip(&self, req: Request<Body>) -> Result<(std::net::IpAddr, String), Error> {
+    fn get_req_ip(&self, req: Request<Body>) -> Result<(std::net::IpAddr, String), DynDnsError> {
         info!("Request to: {}", req.uri());
         let url = Url::parse("http://example.com")
             .and_then(|u| u.join(&req.uri().to_string()))
             .map_err(|_e| DynDnsError::InvalidRequestUrl)?;
         if req.method() != &Method::GET {
-            return Err(DynDnsError::InvalidRequestMethod.into());
+            return Err(DynDnsError::InvalidRequestMethod);
         } else if url.path() != "/nic/update" {
-            return Err(DynDnsError::InvalidRequestPath.into());
+            return Err(DynDnsError::InvalidRequestPath);
         } else {
             let header = req.headers().get(AUTHORIZATION).map(HeaderValue::to_str);
             let header = if let Some(Ok(value)) = header {
@@ -170,12 +208,12 @@ impl DynDnsService {
                 if user.hosts.iter().any(|h| h == hostname) {
                     IpAddr::from_str(ip)
                         .map(|ip| (ip, hostname.to_owned()))
-                        .map_err(|_| DynDnsError::InvalidIpAddress.into())
+                        .map_err(|_| DynDnsError::InvalidIpAddress)
                 } else {
-                    Err(DynDnsError::InvalidHostname.into())
+                    Err(DynDnsError::InvalidHostname)
                 }
             } else {
-                Err(DynDnsError::InvalidQueryParams.into())
+                Err(DynDnsError::InvalidQueryParams)
             }
         }
     }
@@ -189,7 +227,7 @@ struct DnsClient {
 }
 
 impl DnsClient {
-    fn new(config: &Config) -> Result<DnsClient, Error> {
+    fn new(config: &Config) -> Result<DnsClient, DynDnsError> {
         let config = config.clone();
         let creds = StaticProvider::new_minimal(
             config.aws_access_key.clone(),
@@ -200,28 +238,30 @@ impl DnsClient {
         Ok(DnsClient { config, client })
     }
 
-    fn set_ip_record(
+    async fn set_ip_record(
         &self,
         ip: IpAddr,
         hostname: impl AsRef<str>,
-    ) -> impl Future<Item = DnsChangeId, Error = Error> {
+    ) -> Result<DnsChangeId, DynDnsError> {
         info!("Attemping IP update: {}, {}", ip, hostname.as_ref());
         match ip {
             IpAddr::V4(ip) => {
                 self.set_dns_record("A", format!("{}.", hostname.as_ref()), ip.to_string())
+                    .await
             }
             IpAddr::V6(ip) => {
                 self.set_dns_record("AAAA", format!("{}.", hostname.as_ref()), ip.to_string())
+                    .await
             }
         }
     }
 
-    fn set_dns_record<K: Into<String>, N: Into<String>, V: Into<String>>(
+    async fn set_dns_record<K: Into<String>, N: Into<String>, V: Into<String>>(
         &self,
         kind: K,
         name: N,
         value: V,
-    ) -> impl Future<Item = DnsChangeId, Error = Error> {
+    ) -> Result<DnsChangeId, DynDnsError> {
         use rusoto_route53::{
             Change, ChangeBatch, ChangeResourceRecordSetsRequest, ResourceRecord, ResourceRecordSet,
         };
@@ -230,10 +270,10 @@ impl DnsClient {
         let name = name.into();
         let value = value.into();
 
-        let record = ResourceRecord { value: value };
+        let record = ResourceRecord { value };
 
         let record_set = ResourceRecordSet {
-            name: name,
+            name,
             resource_records: Some(vec![record]),
             ttl: Some(300),
             type_: kind,
@@ -251,22 +291,19 @@ impl DnsClient {
         };
 
         let change_req = ChangeResourceRecordSetsRequest {
-            change_batch: change_batch,
+            change_batch,
             hosted_zone_id: self.config.aws_zone_id.clone(),
         };
 
         info!("Submitting DNS change");
-        self.client
-            .change_resource_record_sets(change_req)
-            .and_then(|change| {
-                info!("DNS change submitted");
-                let id = change
-                    .change_info
-                    .id
-                    .get(8..)
-                    .expect("Id should be prefixed with '/change/'"); //Remove '/change/' prefix
-                Ok(DnsChangeId(id.into()))
-            })
-            .from_err()
+        let change = self.client.change_resource_record_sets(change_req).await?;
+
+        info!("DNS change submitted");
+        let id = change
+            .change_info
+            .id
+            .get(8..)
+            .expect("Id should be prefixed with '/change/'"); //Remove '/change/' prefix
+        Ok(DnsChangeId(id.into()))
     }
 }
